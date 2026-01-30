@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""rssmouse - Minimal RSS/Atom feed watcher with Clawdbot integration.
+
+Usage:
+    rssmouse add <url> [--name NAME]
+    rssmouse list
+    rssmouse remove <id>
+    rssmouse check [--quiet]
+    rssmouse watch [--interval SECONDS]
+    rssmouse seen <feed_id>
+    rssmouse clear <feed_id>
+    rssmouse notify <message>
+    rssmouse --help
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+# XDG-compliant data directory
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "rssmouse"
+DB_PATH = DATA_DIR / "rssmouse.db"
+
+# Clawdbot gateway configuration
+GATEWAY_PORT = os.environ.get("CLAWDBOT_GATEWAY_PORT", "18789")
+GATEWAY_TOKEN = os.environ.get("CLAWDBOT_GATEWAY_TOKEN", "")
+GATEWAY_URL = f"http://127.0.0.1:{GATEWAY_PORT}/tools/invoke"
+
+# Namespaces for XML parsing
+NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "rss": "",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "content": "http://purl.org/rss/1.0/modules/content/",
+}
+
+
+def init_db():
+    """Initialize SQLite database with required tables."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    # Feeds table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS feeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            name TEXT,
+            feed_type TEXT,
+            last_check INTEGER,
+            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+        )
+    """)
+    
+    # Seen items table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS seen_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feed_id INTEGER NOT NULL,
+            guid TEXT NOT NULL,
+            title TEXT,
+            link TEXT,
+            published_at TEXT,
+            seen_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
+            UNIQUE (feed_id, guid)
+        )
+    """)
+    
+    conn.commit()
+    return conn
+
+
+def detect_feed_type(root: ET.Element) -> str:
+    """Detect if feed is RSS or Atom."""
+    tag = root.tag.lower()
+    if "feed" in tag:
+        return "atom"
+    elif "rss" in tag or "channel" in tag:
+        return "rss"
+    return "unknown"
+
+
+def parse_atom_entry(entry: ET.Element) -> dict:
+    """Parse an Atom entry element."""
+    # ID
+    id_elem = entry.find("atom:id", NS)
+    guid = id_elem.text if id_elem is not None else None
+    
+    # Title
+    title_elem = entry.find("atom:title", NS)
+    title = title_elem.text if title_elem is not None else "No title"
+    
+    # Link (prefer alternate)
+    link = None
+    for link_elem in entry.findall("atom:link", NS):
+        rel = link_elem.get("rel", "alternate")
+        if rel == "alternate":
+            link = link_elem.get("href")
+            break
+    if not link:
+        link_elem = entry.find("atom:link", NS)
+        link = link_elem.get("href") if link_elem is not None else None
+    
+    # Published/Updated
+    published = None
+    for tag in ["atom:published", "atom:updated"]:
+        pub_elem = entry.find(tag, NS)
+        if pub_elem is not None:
+            published = pub_elem.text
+            break
+    
+    # Content/Summary
+    content = None
+    for tag in ["atom:content", "atom:summary"]:
+        content_elem = entry.find(tag, NS)
+        if content_elem is not None:
+            content = content_elem.text
+            break
+    
+    # Fall back to link as GUID
+    if not guid:
+        guid = link or hashlib.sha256((title or "").encode()).hexdigest()[:16]
+    
+    return {
+        "guid": guid,
+        "title": title,
+        "link": link,
+        "published": published,
+        "content": content,
+    }
+
+
+def parse_rss_item(item: ET.Element) -> dict:
+    """Parse an RSS item element."""
+    # GUID
+    guid_elem = item.find("guid")
+    guid = guid_elem.text if guid_elem is not None else None
+    
+    # Title
+    title_elem = item.find("title")
+    title = title_elem.text if title_elem is not None else "No title"
+    
+    # Link
+    link_elem = item.find("link")
+    link = link_elem.text if link_elem is not None else None
+    
+    # Published
+    published = None
+    for tag in ["pubDate", "dc:date"]:
+        pub_elem = item.find(tag) if ":" not in tag else item.find(tag, NS)
+        if pub_elem is not None:
+            published = pub_elem.text
+            break
+    
+    # Description/Content
+    content = None
+    for tag in ["description", "content:encoded"]:
+        content_elem = item.find(tag) if ":" not in tag else item.find(tag, NS)
+        if content_elem is not None:
+            content = content_elem.text
+            break
+    
+    # Fall back to link as GUID
+    if not guid:
+        guid = link or hashlib.sha256((title or "").encode()).hexdigest()[:16]
+    
+    return {
+        "guid": guid,
+        "title": title,
+        "link": link,
+        "published": published,
+        "content": content,
+    }
+
+
+def fetch_feed(url: str) -> tuple[str, list[dict]]:
+    """Fetch and parse a feed URL. Returns (feed_type, items)."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "rssmouse/1.0 (https://github.com/clawdbot/clawdbot)",
+            "Accept": "application/atom+xml,application/rss+xml,application/xml,text/xml,*/*",
+        }
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            content = response.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP error {e.code}: {e.reason}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"URL error: {e.reason}")
+    
+    # Parse XML
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as e:
+        raise RuntimeError(f"XML parse error: {e}")
+    
+    feed_type = detect_feed_type(root)
+    items = []
+    
+    if feed_type == "atom":
+        for entry in root.findall("atom:entry", NS):
+            items.append(parse_atom_entry(entry))
+    elif feed_type == "rss":
+        # RSS 2.0: root is <rss>, items are in <channel>
+        channel = root.find("channel")
+        if channel is None:
+            channel = root  # RSS 1.0 or malformed
+        for item in channel.findall("item"):
+            items.append(parse_rss_item(item))
+    else:
+        raise RuntimeError(f"Unknown feed type: {root.tag}")
+    
+    return feed_type, items
+
+
+def notify_clawdbot(message: str, label: str = "rssmouse-digest") -> dict:
+    """Spawn a subagent to deliver an RSS notification."""
+    if not GATEWAY_TOKEN:
+        return {"ok": False, "error": "CLAWDBOT_GATEWAY_TOKEN not set"}
+    
+    payload = {
+        "tool": "sessions_spawn",
+        "args": {
+            "task": message,
+            "label": label,
+        }
+    }
+    
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        GATEWAY_URL,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {GATEWAY_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST"
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return {"ok": False, "error": f"HTTP {e.code}: {body}"}
+    except urllib.error.URLError as e:
+        return {"ok": False, "error": str(e.reason)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cmd_add(args):
+    """Add a new feed."""
+    conn = init_db()
+    c = conn.cursor()
+    
+    url = args.url.strip()
+    name = args.name
+    
+    # Fetch to validate and detect type
+    print(f"Fetching {url}...")
+    try:
+        feed_type, items = fetch_feed(url)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    
+    # Auto-generate name if not provided
+    if not name:
+        # Extract domain or last path segment
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        name = parsed.netloc or parsed.path.split("/")[-1] or "feed"
+    
+    try:
+        c.execute(
+            "INSERT INTO feeds (url, name, feed_type) VALUES (?, ?, ?)",
+            (url, name, feed_type)
+        )
+        feed_id = c.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError:
+        print(f"Feed already exists: {url}", file=sys.stderr)
+        return 1
+    
+    print(f"Added feed #{feed_id}: {name} ({feed_type}, {len(items)} items)")
+    
+    # Mark current items as seen (don't notify on first add)
+    for item in items:
+        try:
+            c.execute(
+                "INSERT OR IGNORE INTO seen_items (feed_id, guid, title, link, published_at) VALUES (?, ?, ?, ?, ?)",
+                (feed_id, item["guid"], item["title"], item["link"], item["published"])
+            )
+        except sqlite3.Error:
+            pass
+    
+    conn.commit()
+    conn.close()
+    return 0
+
+
+def cmd_list(args):
+    """List all feeds."""
+    conn = init_db()
+    c = conn.cursor()
+    
+    c.execute("SELECT id, url, name, feed_type, last_check FROM feeds ORDER BY id")
+    feeds = c.fetchall()
+    
+    if not feeds:
+        print("No feeds configured. Use 'rssmouse add <url>' to add one.")
+        return 0
+    
+    print(f"{'ID':>4}  {'Name':<30}  {'Type':<6}  {'Last Check':<20}  URL")
+    print("-" * 100)
+    for feed in feeds:
+        last_check = ""
+        if feed["last_check"]:
+            last_check = datetime.fromtimestamp(feed["last_check"]).strftime("%Y-%m-%d %H:%M")
+        print(f"{feed['id']:>4}  {(feed['name'] or '-'):<30}  {(feed['feed_type'] or '-'):<6}  {last_check:<20}  {feed['url']}")
+    
+    conn.close()
+    return 0
+
+
+def cmd_remove(args):
+    """Remove a feed by ID."""
+    conn = init_db()
+    c = conn.cursor()
+    
+    feed_id = args.id
+    c.execute("SELECT id, name, url FROM feeds WHERE id = ?", (feed_id,))
+    feed = c.fetchone()
+    
+    if not feed:
+        print(f"Feed #{feed_id} not found.", file=sys.stderr)
+        return 1
+    
+    c.execute("DELETE FROM seen_items WHERE feed_id = ?", (feed_id,))
+    c.execute("DELETE FROM feeds WHERE id = ?", (feed_id,))
+    conn.commit()
+    
+    print(f"Removed feed #{feed_id}: {feed['name']} ({feed['url']})")
+    conn.close()
+    return 0
+
+
+def cmd_check(args):
+    """Check all feeds for new items."""
+    conn = init_db()
+    c = conn.cursor()
+    
+    c.execute("SELECT id, url, name, feed_type FROM feeds ORDER BY id")
+    feeds = c.fetchall()
+    
+    if not feeds:
+        if not args.quiet:
+            print("No feeds configured.")
+        return 0
+    
+    all_new_items = []
+    
+    for feed in feeds:
+        feed_id = feed["id"]
+        url = feed["url"]
+        name = feed["name"] or url
+        
+        if not args.quiet:
+            print(f"Checking {name}...", end=" ", flush=True)
+        
+        try:
+            feed_type, items = fetch_feed(url)
+        except RuntimeError as e:
+            if not args.quiet:
+                print(f"ERROR: {e}")
+            continue
+        
+        # Update last check time
+        c.execute("UPDATE feeds SET last_check = ?, feed_type = ? WHERE id = ?",
+                  (int(time.time()), feed_type, feed_id))
+        
+        # Find new items
+        new_items = []
+        for item in items:
+            c.execute("SELECT 1 FROM seen_items WHERE feed_id = ? AND guid = ?",
+                      (feed_id, item["guid"]))
+            if not c.fetchone():
+                new_items.append(item)
+                # Mark as seen
+                c.execute(
+                    "INSERT INTO seen_items (feed_id, guid, title, link, published_at) VALUES (?, ?, ?, ?, ?)",
+                    (feed_id, item["guid"], item["title"], item["link"], item["published"])
+                )
+        
+        conn.commit()
+        
+        if not args.quiet:
+            print(f"{len(new_items)} new items" if new_items else "no new items")
+        
+        for item in new_items:
+            all_new_items.append({
+                "feed_name": name,
+                "feed_id": feed_id,
+                **item
+            })
+    
+    # Notify if new items found
+    if all_new_items:
+        print(f"\n🐭 Found {len(all_new_items)} new item(s)!")
+        for item in all_new_items:
+            print(f"  • [{item['feed_name']}] {item['title']}")
+            if item.get("link"):
+                print(f"    {item['link']}")
+        
+        # Build notification message
+        msg_lines = [f"🐭 **RSS Update**: {len(all_new_items)} new item(s)\n"]
+        for item in all_new_items:
+            msg_lines.append(f"**[{item['feed_name']}]** {item['title']}")
+            if item.get("link"):
+                msg_lines.append(f"  → {item['link']}")
+            msg_lines.append("")
+        
+        msg_lines.append("Acknowledge and report back to the main session with a summary.")
+        message = "\n".join(msg_lines)
+        
+        # Send notification
+        if not args.quiet:
+            print("\nNotifying Clawdbot...")
+        result = notify_clawdbot(message)
+        if result.get("ok"):
+            if not args.quiet:
+                print("Notification sent successfully!")
+        else:
+            print(f"Warning: Notification failed: {result.get('error', 'unknown error')}", file=sys.stderr)
+    
+    conn.close()
+    return 0
+
+
+def cmd_watch(args):
+    """Watch feeds continuously."""
+    interval = args.interval
+    print(f"🐭 rssmouse watching feeds every {interval}s (Ctrl+C to stop)")
+    
+    try:
+        while True:
+            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+            cmd_check(argparse.Namespace(quiet=False))
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
+
+
+def cmd_seen(args):
+    """List seen items for a feed."""
+    conn = init_db()
+    c = conn.cursor()
+    
+    feed_id = args.feed_id
+    c.execute("SELECT name FROM feeds WHERE id = ?", (feed_id,))
+    feed = c.fetchone()
+    
+    if not feed:
+        print(f"Feed #{feed_id} not found.", file=sys.stderr)
+        return 1
+    
+    c.execute("""
+        SELECT guid, title, link, published_at, seen_at
+        FROM seen_items WHERE feed_id = ?
+        ORDER BY seen_at DESC LIMIT 50
+    """, (feed_id,))
+    items = c.fetchall()
+    
+    print(f"Last 50 seen items for feed #{feed_id} ({feed['name']}):")
+    for item in items:
+        seen = datetime.fromtimestamp(item["seen_at"]).strftime("%Y-%m-%d %H:%M")
+        print(f"  [{seen}] {item['title'][:60]}")
+    
+    conn.close()
+    return 0
+
+
+def cmd_clear(args):
+    """Clear seen items for a feed (will re-notify on next check)."""
+    conn = init_db()
+    c = conn.cursor()
+    
+    feed_id = args.feed_id
+    c.execute("SELECT name FROM feeds WHERE id = ?", (feed_id,))
+    feed = c.fetchone()
+    
+    if not feed:
+        print(f"Feed #{feed_id} not found.", file=sys.stderr)
+        return 1
+    
+    c.execute("DELETE FROM seen_items WHERE feed_id = ?", (feed_id,))
+    conn.commit()
+    
+    print(f"Cleared seen items for feed #{feed_id} ({feed['name']})")
+    conn.close()
+    return 0
+
+
+def cmd_notify(args):
+    """Send a test notification to Clawdbot."""
+    message = args.message
+    print(f"Sending notification: {message[:50]}...")
+    result = notify_clawdbot(message, label="rssmouse-test")
+    
+    if result.get("ok"):
+        print("Notification sent!")
+        if "result" in result:
+            print(f"Result: {json.dumps(result['result'], indent=2)}")
+    else:
+        print(f"Error: {result.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Minimal RSS/Atom feed watcher with Clawdbot integration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # add
+    p_add = subparsers.add_parser("add", help="Add a feed")
+    p_add.add_argument("url", help="Feed URL")
+    p_add.add_argument("--name", "-n", help="Feed name (auto-detected if not provided)")
+    p_add.set_defaults(func=cmd_add)
+    
+    # list
+    p_list = subparsers.add_parser("list", help="List all feeds")
+    p_list.set_defaults(func=cmd_list)
+    
+    # remove
+    p_remove = subparsers.add_parser("remove", help="Remove a feed")
+    p_remove.add_argument("id", type=int, help="Feed ID")
+    p_remove.set_defaults(func=cmd_remove)
+    
+    # check
+    p_check = subparsers.add_parser("check", help="Check all feeds for new items")
+    p_check.add_argument("--quiet", "-q", action="store_true", help="Suppress output")
+    p_check.set_defaults(func=cmd_check)
+    
+    # watch
+    p_watch = subparsers.add_parser("watch", help="Watch feeds continuously")
+    p_watch.add_argument("--interval", "-i", type=int, default=300, help="Check interval in seconds (default: 300)")
+    p_watch.set_defaults(func=cmd_watch)
+    
+    # seen
+    p_seen = subparsers.add_parser("seen", help="List seen items for a feed")
+    p_seen.add_argument("feed_id", type=int, help="Feed ID")
+    p_seen.set_defaults(func=cmd_seen)
+    
+    # clear
+    p_clear = subparsers.add_parser("clear", help="Clear seen items for a feed")
+    p_clear.add_argument("feed_id", type=int, help="Feed ID")
+    p_clear.set_defaults(func=cmd_clear)
+    
+    # notify
+    p_notify = subparsers.add_parser("notify", help="Send a test notification")
+    p_notify.add_argument("message", help="Message to send")
+    p_notify.set_defaults(func=cmd_notify)
+    
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
