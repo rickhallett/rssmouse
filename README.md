@@ -6,6 +6,12 @@
   <em>RSS/Atom feeds • SQLite dedup • Clawdbot integration</em>
 </p>
 
+<p align="center">
+  <a href="#installation">Installation</a> •
+  <a href="#usage">Usage</a> •
+  <a href="https://tools.oceanheart.ai">all tools</a>
+</p>
+
 ---
 
 ## Features
