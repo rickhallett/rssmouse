@@ -1,6 +1,12 @@
-# rssmouse 🐭
+<p align="center">
+  <img src="assets/social-preview.svg" alt="rssmouse" width="600"/>
+</p>
 
-Minimal RSS/Atom feed watcher with Clawdbot integration.
+<p align="center">
+  <em>RSS/Atom feeds • SQLite dedup • Clawdbot integration</em>
+</p>
+
+---
 
 ## Features
 
